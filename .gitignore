@@ -2,3 +2,4 @@ venv/
 .idea/
 *.iml
 */__pycache__/
+reddit-modmail/praw.ini
