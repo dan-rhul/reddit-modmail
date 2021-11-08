@@ -1,12 +1,13 @@
 import asyncio
+import re
+import time
 from enum import Enum, unique, auto
 from threading import Thread
 import logging
-from typing import Optional, Tuple, Union, OrderedDict, List
+from typing import Optional, Tuple, Union, List
 
 import asyncpraw
 from asyncpraw.models import ModmailConversation
-from asyncpraw.models.reddit.subreddit import Modmail
 from asyncpraw.reddit import Subreddit
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMapItemsView
@@ -14,6 +15,95 @@ from ruamel.yaml.comments import CommentedMapItemsView
 logging.basicConfig(
     level=logging.INFO
 )
+
+
+class Selectors:
+    # https://github.com/reddit-archive/reddit/blob/master/r2/r2/lib/automoderator.py#L403
+    types = {
+        "includes-word": r"(?:^|\W|\b)%s(?:$|\W|\b)",
+        "includes": u"%s",
+        "starts-with": u"^%s",
+        "ends-with": u"%s$",
+        "full-exact": u"^%s$",
+        "full-text": r"^\W*%s\W*$"
+    }
+
+    modifiers = [
+        "case-insensitive",
+        "case-sensitive",
+        "regex"
+    ]
+
+    @staticmethod
+    def match(values: List[str], text: str, selector_regex: str, modifier: str = "case-insensitive") -> bool:
+        # https://github.com/reddit-archive/reddit/blob/master/r2/r2/lib/automoderator.py#L722
+        match_values = values
+
+        if modifier != "regex":
+            match_values = [re.escape(value) for value in match_values]
+
+        value_str = u"(%s)" % "|".join(match_values)
+        pattern = selector_regex % value_str
+
+        flags = re.DOTALL | re.UNICODE
+        if modifier == "case-insensitive":
+            flags |= re.IGNORECASE
+
+        match_pattern = re.compile(pattern, flags)
+        print(pattern)
+        print(value_str)
+
+        return bool(match_pattern.search(text))
+
+
+class Thresholds:
+    comparators = {
+        ">": lambda value, to_compare: value > to_compare,
+        "<": lambda value, to_compare: value < to_compare
+    }
+    time_units = {
+        "minutes":                        60 * 1000,
+        "hours":                     60 * 60 * 1000,
+        "days":                 24 * 60 * 60 * 1000,
+        "weeks":            7 * 24 * 60 * 60 * 1000,
+        "months":      30 * 7 * 24 * 60 * 60 * 1000,
+        "years":  12 * 30 * 7 * 24 * 60 * 60 * 1000
+    }
+
+    @staticmethod
+    def parse(threshold_text: str) -> Optional['Thresholds']:
+        # minimum: >1, <1
+        # should be at least 2 letters, the comparator and value
+        if len(threshold_text) <= 2:
+            return None
+
+        comparator = threshold_text[0]
+        if comparator not in Thresholds.comparators.keys():
+            return None
+
+        value_split = threshold_text[1:].strip().split(" ", 1)
+
+        try:
+            value = int(value_split[0])
+        except TypeError as error:
+            logging.error(f"Failed to parse threshold text: {threshold_text}.", error)
+            return None
+
+        time_unit = Thresholds.time_units.get(value_split[1])
+        if time_unit is not None:
+            value = value * time_unit
+
+        return Thresholds(comparator, value)
+
+    def __init__(self, comparator: str, value: int):
+        self.comparator = comparator
+        self.value = value
+
+    def satisfies(self, value: int, is_time: bool = False) -> bool:
+        if is_time:
+            value = value + (time.time_ns() // 1000000)
+
+        return Thresholds.comparators[self.comparator](value, self.value)
 
 
 @unique
@@ -24,23 +114,25 @@ class Rule(Enum):
     CONTENT: auto()
     SUBJECT: auto()
 
+    CONTENT_LONGER_THAN: auto()
+    CONTENT_SHORTER_THAN: auto()
+
     AUTHOR_POST_KARMA: auto()
     AUTHOR_COMMENT_KARMA: auto()
     AUTHOR_COMBINED_KARMA: auto()
     AUTHOR_ACCOUNT_AGE: auto()
-    AUTHOR_SATISFY_ANY_THRESHOLD: auto()
-
-    CONTENT_LONGER_THAN: auto()
-    CONTENT_SHORTER_THAN: auto()
+    AUTHOR_HAS_VERIFIED_EMAIL: auto()
 
     AUTHOR_IS_CONTRIBUTOR: auto()
     AUTHOR_IS_MODERATOR: auto()
+
+    AUTHOR_SATISFY_ANY_THRESHOLD: auto()
 
     IS_TOP_LEVEL: auto()
     TYPE: auto()
 
     def as_yaml_key(self) -> str:
-        if str.startswith(self.name, "AUTHOR"):
+        if str.startswith(self.name, "AUTHOR_"):
             key = str.replace(self.name, "AUTHOR_", "author.")
         else:
             key = self.name
@@ -51,12 +143,9 @@ class Rule(Enum):
     def get_priority(self) -> int:
         return self.value
 
-    def is_required(self) -> bool:
-        match self:
-            case self.TYPE | self.CONTENT | self.SUBJECT | self.ACTION:
-                return True
-            case _:
-                return False
+    @staticmethod
+    def is_required(rule: 'Rule') -> bool:
+        return rule in [Rule.TYPE, Rule.CONTENT, Rule.SUBJECT, Rule.ACTION]
 
     @staticmethod
     def get_required_num() -> int:
@@ -66,23 +155,26 @@ class Rule(Enum):
 
 class RuleActions:
     @staticmethod
-    def parse(rules: Tuple[str, Union[str, OrderedDict]]) -> Optional['RuleActions']:
-        rules_found: List[Tuple[Rule, Optional[str], Union[str, OrderedDict]]]
+    def parse(rules: Tuple[str, list]) -> Optional['RuleActions']:
+        rules_found: List[Tuple[Rule, Optional[str], list]]
         rules_found = []
 
         for rule in Rule:
             rule_key: str
-            rule_value: Union[str, OrderedDict]
+            rule_value: Union[str, list]
             for rule_key, rule_value in rules:
                 selector: Optional[str]
                 selector = None
 
                 if "(" in rule_key and ")" in rule_key:
-                    _rule_key_split = str.split(rule_key, "(", 1)
-                    selector = str.strip(_rule_key_split[1].replace(")", "", 1))
-                    rule_key = rule_key.strip(_rule_key_split[0])
+                    _rule_key_split = rule_key.split("(", 1)
+                    selector = _rule_key_split[1].replace(")", "", 1).strip()
+                    rule_key = _rule_key_split[0].strip()
 
                 if rule.as_yaml_key() != rule_key:
+                    continue
+
+                if isinstance(rule_value, list) and len(rule_value) <= 0:
                     continue
 
                 # removes elements from found rules if it is already in the list
@@ -90,21 +182,127 @@ class RuleActions:
                 # rules
                 rules_found = [(list_rule, list_selector, list_value) for (list_rule, list_selector, list_value) in rules_found if list_rule != rule]
 
+                if not isinstance(rule_value, list):
+                    rule_value = [rule_value]
+
                 rules_found.append((rule, selector, rule_value))
 
         if len(rules_found) < Rule.get_required_num():
             return None
 
+        if len([(list_rule, list_selector, list_value) for (list_rule, list_selector, list_value) in rules_found if Rule.is_required(list_rule)]) < Rule.get_required_num():
+            return None
+
+        rules_found.sort(key=lambda action_tuple: action_tuple[0].value, reverse=True)
+
         return RuleActions(rules_found)
 
-    def __init__(self, actions: List[Tuple[Rule, Optional[str], Union[str, OrderedDict]]]):
+    def __init__(self, actions: List[Tuple[Rule, Optional[str], list]]):
         self.actions = actions
 
-    def should_action(self, conversation: Modmail, state: str) -> bool:
+    async def should_action(self, conversation: ModmailConversation, subreddit: Subreddit, state: str) -> bool:
+        author_satisfy_any_threshold = False
+        author_satisfied = False
+
+        last_message = conversation.messages[-1]
+
+        # actions list is sorted by rule priority already
+        for action in self.actions:
+            rule = action[0]
+            selector = action[1]
+            values = action[2]
+
+            if rule == Rule.TYPE and state not in values:
+                continue
+
+            if rule == Rule.IS_TOP_LEVEL and len(conversation.messages) > 1:
+                continue
+
+            # author related rules
+            if rule == Rule.AUTHOR_SATISFY_ANY_THRESHOLD:
+                author_satisfy_any_threshold = True
+                continue
+
+            if rule.name.startswith("AUTHOR_"):
+                if author_satisfy_any_threshold and author_satisfied:
+                    continue
+
+                # further author rules require re-fetching author object
+                await last_message.author.load()
+
+                if rule == Rule.AUTHOR_IS_MODERATOR and values[0]:
+                    is_moderator = False
+
+                    async for moderator in subreddit.moderator:
+                        if moderator.id == last_message.author.fullname:
+                            is_moderator = True
+                            break
+
+                    author_satisfied = is_moderator
+                elif rule == Rule.AUTHOR_IS_CONTRIBUTOR and values[0]:
+                    is_contributor = False
+
+                    async for contributor in subreddit.contributor:
+                        if contributor.id == last_message.author.fullname:
+                            is_contributor = True
+                            break
+
+                    author_satisfied = is_contributor
+                elif rule == Rule.AUTHOR_HAS_VERIFIED_EMAIL and values[0]:
+                    author_satisfied = last_message.author.has_verified_email
+                else:
+                    threshold = Thresholds.parse(values[0])
+                    if threshold is None:
+                        return False
+
+                    if rule == Rule.AUTHOR_ACCOUNT_AGE:
+                        author_satisfied = threshold.satisfies(last_message.author.created_utc, True)
+                    elif rule == Rule.AUTHOR_COMBINED_KARMA:
+                        combined_karma = last_message.author.comment_karma + last_message.author.link_karma
+
+                        author_satisfied = threshold.satisfies(combined_karma)
+                    elif rule == Rule.AUTHOR_COMMENT_KARMA:
+                        author_satisfied = threshold.satisfies(last_message.author.comment_karma)
+                    elif rule == Rule.AUTHOR_POST_KARMA:
+                        author_satisfied = threshold.satisfies(last_message.author.link_karma)
+
+                if not author_satisfy_any_threshold and not author_satisfied:
+                    return False
+
+            if rule == Rule.CONTENT_SHORTER_THAN and len(last_message.body_markdown) < values[0]:
+                return False
+
+            if rule == Rule.CONTENT_LONGER_THAN and len(last_message.body_markdown) > values[0]:
+                return False
+
+            if rule == Rule.SUBJECT or rule == Rule.CONTENT:
+                if rule == Rule.SUBJECT:
+                    text = conversation.subject
+                else:
+                    text = last_message.body_markdown
+
+                modifier = None
+                if "," in selector:
+                    _selector_split = selector.split(",", 1)
+                    modifier = _selector_split[1].strip()
+                    selector_regex = Selectors.types[_selector_split[0].strip()]
+                else:
+                    selector_regex = Selectors.types[selector]
+
+                if not Selectors.match(values, text, selector_regex, modifier):
+                    return False
+
+        return True
+
+    def run(self, conversation: ModmailConversation, subreddit: Subreddit, state: str) -> bool:
         pass
 
-    def run(self, conversation: Modmail, state: str) -> bool:
-        pass
+    def get_action(self, rule: Rule) -> Tuple[Rule, Optional[str], list]:
+        for action in self.actions:
+            if action[0] == rule:
+                return action
+
+        raise KeyError("No action was found for rule " + rule.name)
 
 
 class RedditModmail:
@@ -145,10 +343,10 @@ class RedditModmail:
 
         for rule_pair in rules:
             rule_action = RuleActions.parse(rule_pair[1].items())
-            if rule_action is None or not rule_action.should_action(conversation, state):
+            if rule_action is None or not await rule_action.should_action(conversation, subreddit, state):
                 continue
 
-            rule_action.run(conversation, state)
+            rule_action.run(conversation, subreddit, state)
             return True
 
         return False
@@ -165,7 +363,7 @@ class RedditModmail:
         return type_rules
 
     async def get_config(self, subreddit: Subreddit, wiki_page: str) -> str:
-        return await subreddit.wiki.get_page(wiki_page).content_md
+        return (await subreddit.wiki.get_page(wiki_page)).content_md
 
     def parse_config_yaml(self, text: str) -> CommentedMapItemsView:
         return self.yaml.load(text).items()
