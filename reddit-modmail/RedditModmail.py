@@ -342,12 +342,14 @@ class RuleActions:
                 action_values = sorted(values)
                 for value in action_values:
                     if value == "highlight":
-                        await conversation.highlight()
+                        if not conversation.is_highlighted:
+                            await conversation.highlight()
                         actioned = True
                         continue
 
                     if value == "remove":
-                        await conversation.unhighlight()
+                        if conversation.is_highlisted:
+                            await conversation.unhighlight()
                         await conversation.archive()
 
         return actioned
