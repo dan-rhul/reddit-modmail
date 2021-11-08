@@ -4,17 +4,41 @@ import time
 from enum import Enum, unique, auto
 from threading import Thread
 import logging
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Tuple, Union, List, Callable, Dict
 
 import asyncpraw
 from asyncpraw.models import ModmailConversation
-from asyncpraw.reddit import Subreddit
+from asyncpraw.reddit import Subreddit, Redditor
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMapItemsView
 
 logging.basicConfig(
     level=logging.INFO
 )
+
+
+class Placeholders:
+    types: Dict[str, Callable[[Redditor, ModmailConversation], str]]
+    types = {
+        "{{author}}": lambda user, modmail: user.name,
+        "{{content}}": lambda user, modmail: modmail.messages[-1].body_markdown,
+        "{{permalink}}": lambda user, modmail: f"https://www.reddit.com/message/messages/{modmail.legacy_first_message_id}",
+        "{{subreddit}}": lambda user, modmail: modmail.owner.display_name if modmail.owner is not None else "",
+        "{{kind}}": lambda user, modmail: "message" if len(modmail.message) <= 2 else "reply", # <= 2 instead of <= 1 to accommodate the new message
+        "{{subject}}": lambda user, modmail: modmail.subject
+    }
+
+    @staticmethod
+    def replace_str(text: str, user: Redditor, modmail: ModmailConversation) -> str:
+        replaced_str = text
+
+        for placeholder, data_func in Placeholders.types:
+            if placeholder not in replaced_str:
+                continue
+
+            replaced_str.replace(placeholder, data_func(user, modmail))
+
+        return replaced_str
 
 
 class Selectors:
@@ -297,7 +321,7 @@ class RuleActions:
 
         return True
 
-    async def run(self, conversation: ModmailConversation, subreddit: Subreddit, state: str) -> bool:
+    async def run(self, conversation: ModmailConversation) -> bool:
         actioned = False
 
         for action in self.actions:
@@ -308,7 +332,8 @@ class RuleActions:
                 continue
 
             if rule == Rule.COMMENT:
-                body = "\n".join(values)
+                author = await conversation.messages[-1].author.load()
+                body = Placeholders.replace_str("\n".join(values), author, conversation)
                 await conversation.reply(body)
                 actioned = True
                 continue
@@ -376,8 +401,8 @@ class RedditModmail:
             if rule_action is None or not await rule_action.should_action(conversation, subreddit, state):
                 continue
 
-            rule_action.run(conversation, subreddit, state)
-            return True
+            if rule_action.run(conversation):
+                return True
 
         return False
 
