@@ -174,8 +174,11 @@ class RuleActions:
                 if rule.as_yaml_key() != rule_key:
                     continue
 
-                if isinstance(rule_value, list) and len(rule_value) <= 0:
+                if len(rule_value) <= 0:
                     continue
+
+                if rule == Rule.COMMENT and isinstance(rule_value, str) and "\\n" in rule_value:
+                    rule_value = rule_value.split("\\n")
 
                 # removes elements from found rules if it is already in the list
                 # this is to replicate the behaviour of auto mod, where the latter rule is used if there are duplicate
@@ -294,8 +297,35 @@ class RuleActions:
 
         return True
 
-    def run(self, conversation: ModmailConversation, subreddit: Subreddit, state: str) -> bool:
-        pass
+    async def run(self, conversation: ModmailConversation, subreddit: Subreddit, state: str) -> bool:
+        actioned = False
+
+        for action in self.actions:
+            rule = action[0]
+            values = action[2]
+
+            if rule not in [Rule.ACTION, Rule.COMMENT]:
+                continue
+
+            if rule == Rule.COMMENT:
+                body = "\n".join(values)
+                await conversation.reply(body)
+                actioned = True
+                continue
+
+            if rule == Rule.ACTION:
+                action_values = sorted(values)
+                for value in action_values:
+                    if value == "highlight":
+                        await conversation.highlight()
+                        actioned = True
+                        continue
+
+                    if value == "remove":
+                        await conversation.unhighlight()
+                        await conversation.archive()
+
+        return actioned
 
     def get_action(self, rule: Rule) -> Tuple[Rule, Optional[str], list]:
         for action in self.actions:
