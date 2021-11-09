@@ -6,11 +6,12 @@ from threading import Thread
 import logging
 from typing import Optional, Tuple, Union, List, Callable, Dict
 
-import asyncpraw
 from asyncpraw.models import ModmailConversation
 from asyncpraw.reddit import Subreddit, Redditor
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMapItemsView
+
+from prawvents.prawvents import EventReddit
 
 logging.basicConfig(
     level=logging.INFO
@@ -24,7 +25,8 @@ class Placeholders:
         "{{content}}": lambda user, modmail: modmail.messages[-1].body_markdown,
         "{{permalink}}": lambda user, modmail: f"https://www.reddit.com/message/messages/{modmail.legacy_first_message_id}",
         "{{subreddit}}": lambda user, modmail: modmail.owner.display_name if modmail.owner is not None else "",
-        "{{kind}}": lambda user, modmail: "message" if len(modmail.message) <= 2 else "reply", # <= 2 instead of <= 1 to accommodate the new message
+        # <= 2 instead of <= 1 to accommodate the new message
+        "{{kind}}": lambda user, modmail: "message" if len(modmail.message) <= 2 else "reply",
         "{{subject}}": lambda user, modmail: modmail.subject
     }
 
@@ -74,8 +76,6 @@ class Selectors:
             flags |= re.IGNORECASE
 
         match_pattern = re.compile(pattern, flags)
-        print(pattern)
-        print(value_str)
 
         return bool(match_pattern.search(text))
 
@@ -86,12 +86,12 @@ class Thresholds:
         "<": lambda value, to_compare: value < to_compare
     }
     time_units = {
-        "minutes":                        60 * 1000,
-        "hours":                     60 * 60 * 1000,
-        "days":                 24 * 60 * 60 * 1000,
-        "weeks":            7 * 24 * 60 * 60 * 1000,
-        "months":      30 * 7 * 24 * 60 * 60 * 1000,
-        "years":  12 * 30 * 7 * 24 * 60 * 60 * 1000
+        "minutes": 60 * 1000,
+        "hours": 60 * 60 * 1000,
+        "days": 24 * 60 * 60 * 1000,
+        "weeks": 7 * 24 * 60 * 60 * 1000,
+        "months": 30 * 7 * 24 * 60 * 60 * 1000,
+        "years": 12 * 30 * 7 * 24 * 60 * 60 * 1000
     }
 
     @staticmethod
@@ -207,7 +207,8 @@ class RuleActions:
                 # removes elements from found rules if it is already in the list
                 # this is to replicate the behaviour of auto mod, where the latter rule is used if there are duplicate
                 # rules
-                rules_found = [(list_rule, list_selector, list_value) for (list_rule, list_selector, list_value) in rules_found if list_rule != rule]
+                rules_found = [(list_rule, list_selector, list_value) for (list_rule, list_selector, list_value) in
+                               rules_found if list_rule != rule]
 
                 if not isinstance(rule_value, list):
                     rule_value = [rule_value]
@@ -217,7 +218,8 @@ class RuleActions:
         if len(rules_found) < Rule.get_required_num():
             return None
 
-        if len([(list_rule, list_selector, list_value) for (list_rule, list_selector, list_value) in rules_found if Rule.is_required(list_rule)]) < Rule.get_required_num():
+        if len([(list_rule, list_selector, list_value) for (list_rule, list_selector, list_value) in rules_found if
+                Rule.is_required(list_rule)]) < Rule.get_required_num():
             return None
 
         rules_found.sort(key=lambda action_tuple: action_tuple[0].value, reverse=True)
@@ -364,34 +366,28 @@ class RuleActions:
 
 class RedditModmail:
     def __init__(self):
-        self.reddit = asyncpraw.Reddit("bot", config_interpolation="basic")
+        self.reddit = EventReddit("bot", config_interpolation="basic")
         self.yaml = YAML()
 
         self.loop = asyncio.get_event_loop()
 
-    def listen(self, subreddit: str):
-        t = Thread(target=lambda: (
-            self.loop.create_task(self.__listen(subreddit)),
-            self.loop.run_forever())
-                   )
-        t.start()
+        self.has_listened = False
 
-    async def __listen(self, subreddit: str):
+    async def listen(self, subreddit: str):
         logging.info("Listening to modmail from subreddit: " + subreddit)
         subreddit_model = await self.reddit.subreddit(subreddit)
 
-        await asyncio.gather(*map(
-            lambda state: self.__listen_state(subreddit_model, state),
-            ["appeals", "archived", "inprogress", "join_requests", "mod", "new", "notifications"]
-        ))
+        for state in ["appeals", "archived", "inprogress", "join_requests", "mod", "new", "notifications"]:
+            @self.reddit.register_event(subreddit_model.mod.stream.modmail_conversations, sort="recent", state=state)
+            async def on_message(message: ModmailConversation, message_state=state):
+                await self.handle_message(subreddit_model, message, message_state)
 
-    async def __listen_state(self, subreddit: Subreddit, state: str):
-        async for message in subreddit.mod.stream.modmail_conversations(sort="recent",
-                                                                        state=state):
-            await self.handle_message(subreddit, message, state)
+        if not self.has_listened:
+            self.has_listened = True
+            await self.reddit.run_loop()
 
     async def handle_message(self, subreddit: Subreddit, message: ModmailConversation, state: str) -> bool:
-        conversation = await subreddit.modmail(message.id)
+        await message.load()
 
         config = self.parse_config_yaml(await self.get_config(subreddit, "reddit_modmail"))
         rules = self.get_rules_of_type(state, config)
@@ -400,10 +396,10 @@ class RedditModmail:
 
         for rule_pair in rules:
             rule_action = RuleActions.parse(rule_pair[1].items())
-            if rule_action is None or not await rule_action.should_action(conversation, subreddit, state):
+            if rule_action is None or not await rule_action.should_action(message, subreddit, state):
                 continue
 
-            if rule_action.run(conversation):
+            if rule_action.run(message):
                 return True
 
         return False
@@ -413,7 +409,8 @@ class RedditModmail:
 
         for item in rules:
             for key, value in item[1].items():
-                if key == Rule.TYPE.as_yaml_key() and (isinstance(value, str) and value == rule_type) or (isinstance(value, list) and rule_type in value):
+                if key == Rule.TYPE.as_yaml_key() and (isinstance(value, str) and value == rule_type) or (
+                        isinstance(value, list) and rule_type in value):
                     type_rules.append(item)
                     break
 
