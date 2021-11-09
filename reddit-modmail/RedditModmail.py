@@ -2,14 +2,12 @@ import asyncio
 import re
 import time
 from enum import Enum, unique, auto
-from threading import Thread
 import logging
-from typing import Optional, Tuple, Union, List, Callable, Dict
+from typing import Optional, Tuple, Union, List, Callable, Dict, Any
 
 from asyncpraw.models import ModmailConversation
 from asyncpraw.reddit import Subreddit, Redditor
 from ruamel.yaml import YAML
-from ruamel.yaml.comments import CommentedMapItemsView
 
 from prawvents.prawvents import EventReddit
 
@@ -23,7 +21,8 @@ class Placeholders:
     types = {
         "{{author}}": lambda user, modmail: user.name,
         "{{content}}": lambda user, modmail: modmail.messages[-1].body_markdown,
-        "{{permalink}}": lambda user, modmail: f"https://www.reddit.com/message/messages/{modmail.legacy_first_message_id}",
+        "{{permalink}}": lambda user,
+                                modmail: f"https://www.reddit.com/message/messages/{modmail.legacy_first_message_id}",
         "{{subreddit}}": lambda user, modmail: modmail.owner.display_name if modmail.owner is not None else "",
         # <= 2 instead of <= 1 to accommodate the new message
         "{{kind}}": lambda user, modmail: "message" if len(modmail.message) <= 2 else "reply",
@@ -179,47 +178,51 @@ class Rule(Enum):
 
 class RuleActions:
     @staticmethod
-    def parse(rules: Tuple[str, list]) -> Optional['RuleActions']:
+    def parse(rules: List[Tuple[str, Union[str, int, List[str]]]]) -> Optional['RuleActions']:
         rules_found: List[Tuple[Rule, Optional[str], list]]
         rules_found = []
 
-        for rule in Rule:
-            rule_key: str
-            rule_value: Union[str, list]
-            for rule_key, rule_value in rules:
-                selector: Optional[str]
-                selector = None
+        for key, value in rules:
+            rule_key = key
+            rule_value = value
 
-                if "(" in rule_key and ")" in rule_key:
-                    _rule_key_split = rule_key.split("(", 1)
-                    selector = _rule_key_split[1].replace(")", "", 1).strip()
-                    rule_key = _rule_key_split[0].strip()
+            if len(rule_value) <= 0:
+                continue
 
-                if rule.as_yaml_key() != rule_key:
-                    continue
+            selector: Optional[str]
+            selector = None
 
-                if len(rule_value) <= 0:
-                    continue
+            if "(" in rule_key and ")" in rule_key:
+                _rule_key_split = rule_key.split("(", 1)
+                selector = _rule_key_split[1].replace(")", "", 1).strip()
+                rule_key = _rule_key_split[0].strip()
 
-                if rule == Rule.COMMENT and isinstance(rule_value, str) and "\\n" in rule_value:
-                    rule_value = rule_value.split("\\n")
+            rule = None
+            for rule_obj in Rule:
+                if rule_obj.as_yaml_key() == rule_key:
+                    rule = rule_obj
+                    break
 
-                # removes elements from found rules if it is already in the list
-                # this is to replicate the behaviour of auto mod, where the latter rule is used if there are duplicate
-                # rules
-                rules_found = [(list_rule, list_selector, list_value) for (list_rule, list_selector, list_value) in
-                               rules_found if list_rule != rule]
+            if rule is None:
+                continue
 
-                if not isinstance(rule_value, list):
-                    rule_value = [rule_value]
+            if rule == Rule.COMMENT and isinstance(rule_value, str) and "\\n" in rule_value:
+                rule_value = rule_value.split("\\n")
 
-                rules_found.append((rule, selector, rule_value))
+            if not isinstance(rule_value, list):
+                rule_value = [rule_value]
+
+            # removes elements from found rules if it is already in the list
+            # this is to replicate the behaviour of auto mod, where the latter rule is used if there are duplicate
+            # rules
+            rules_found = [rule_found for rule_found in rules_found if rule_found[0] != rule]
+
+            rules_found.append((rule, selector, rule_value))
 
         if len(rules_found) < Rule.get_required_num():
             return None
 
-        if len([(list_rule, list_selector, list_value) for (list_rule, list_selector, list_value) in rules_found if
-                Rule.is_required(list_rule)]) < Rule.get_required_num():
+        if len([rule_found for rule_found in rules_found if Rule.is_required(rule_found[0])]) < Rule.get_required_num():
             return None
 
         rules_found.sort(key=lambda action_tuple: action_tuple[0].value, reverse=True)
@@ -394,8 +397,8 @@ class RedditModmail:
         if len(rules) == 0:
             return False
 
-        for rule_pair in rules:
-            rule_action = RuleActions.parse(rule_pair[1].items())
+        for rule in rules:
+            rule_action = RuleActions.parse(list(rule.items()))  # type: ignore
             if rule_action is None or not await rule_action.should_action(message, subreddit, state):
                 continue
 
@@ -404,20 +407,79 @@ class RedditModmail:
 
         return False
 
-    def get_rules_of_type(self, rule_type: str, rules: CommentedMapItemsView) -> []:
+    def get_rules_of_type(self, rule_type: str, rules: List[Dict[str, Union[str, int, List[str]]]]) -> []:
         type_rules = []
 
-        for item in rules:
-            for key, value in item[1].items():
-                if key == Rule.TYPE.as_yaml_key() and (isinstance(value, str) and value == rule_type) or (
-                        isinstance(value, list) and rule_type in value):
-                    type_rules.append(item)
-                    break
+        for rule in rules:
+            type_value = rule.get(Rule.TYPE.as_yaml_key())
+            if type_value is None:
+                continue
+
+            if isinstance(type_value, str) and type_value != rule_type:
+                continue
+
+            if isinstance(type_value, list) and rule_type not in type_value:
+                continue
+
+            type_rules.append(rule)
 
         return type_rules
 
     async def get_config(self, subreddit: Subreddit, wiki_page: str) -> str:
         return (await subreddit.wiki.get_page(wiki_page)).content_md
 
-    def parse_config_yaml(self, text: str) -> CommentedMapItemsView:
-        return self.yaml.load(text).items()
+    def parse_config_yaml(self, text: str) -> List[Dict[str, Union[str, int, List[str]]]]:
+        # https://github.com/reddit-archive/reddit/blob/master/r2/r2/lib/automoderator.py#L209
+        rules: List[Dict[str, Union[str, int, List[str]]]]
+        rules = []
+
+        sections = [section.strip("\r\n") for section in re.split("^---", text, flags=re.MULTILINE)]
+        for section in sections:
+            try:
+                parsed = self.yaml.load(section)
+            except Exception as error:
+                raise ValueError(f"YAML parse error: {section}", error)
+
+            if not isinstance(parsed, dict):
+                continue
+
+            section_rules: List[Tuple[str, Union[str, int, List[str]]]]
+            section_rules = []
+            for key in parsed:
+                value = parsed[key]
+
+                # it is a nested value, i.e:
+                # author: {
+                #   is_moderator: True
+                # }
+                if isinstance(value, dict):
+                    key_prefix = key + "."
+                    for inner_key in value.keys():
+                        inner_value = value[inner_key]
+
+                        if self._check_parsed_value(inner_value):
+                            section_rules.append((key_prefix + inner_key, inner_value))
+                    continue
+
+                if self._check_parsed_value(value):
+                    section_rules.append((key, value))
+
+            if len(section_rules) <= 0:
+                continue
+
+            rules_dict = {}
+            for section_rule_name, section_rule_value in section_rules:
+                rules_dict[section_rule_name] = section_rule_value
+
+            rules.append(rules_dict)
+
+        return rules
+
+    def _check_parsed_value(self, value: Any) -> bool:
+        if value is None:
+            return False
+
+        if not isinstance(value, (str, int, List[str])):
+            return False
+
+        return True
