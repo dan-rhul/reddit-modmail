@@ -3,3 +3,4 @@ venv/
 *.iml
 */__pycache__/
 reddit-modmail/praw.ini
+reddit-modmail/subreddits.txt

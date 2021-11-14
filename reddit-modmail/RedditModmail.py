@@ -131,28 +131,28 @@ class Thresholds:
 
 @unique
 class Rule(Enum):
-    ACTION: auto()
-    COMMENT: auto()
+    ACTION = auto()
+    COMMENT = auto()
 
-    CONTENT: auto()
-    SUBJECT: auto()
+    CONTENT = auto()
+    SUBJECT = auto()
 
-    CONTENT_LONGER_THAN: auto()
-    CONTENT_SHORTER_THAN: auto()
+    CONTENT_LONGER_THAN = auto()
+    CONTENT_SHORTER_THAN = auto()
 
-    AUTHOR_POST_KARMA: auto()
-    AUTHOR_COMMENT_KARMA: auto()
-    AUTHOR_COMBINED_KARMA: auto()
-    AUTHOR_ACCOUNT_AGE: auto()
-    AUTHOR_HAS_VERIFIED_EMAIL: auto()
+    AUTHOR_POST_KARMA = auto()
+    AUTHOR_COMMENT_KARMA = auto()
+    AUTHOR_COMBINED_KARMA = auto()
+    AUTHOR_ACCOUNT_AGE = auto()
+    AUTHOR_HAS_VERIFIED_EMAIL = auto()
 
-    AUTHOR_IS_CONTRIBUTOR: auto()
-    AUTHOR_IS_MODERATOR: auto()
+    AUTHOR_IS_CONTRIBUTOR = auto()
+    AUTHOR_IS_MODERATOR = auto()
 
-    AUTHOR_SATISFY_ANY_THRESHOLD: auto()
+    AUTHOR_SATISFY_ANY_THRESHOLD = auto()
 
-    IS_TOP_LEVEL: auto()
-    TYPE: auto()
+    IS_TOP_LEVEL = auto()
+    TYPE = auto()
 
     def as_yaml_key(self) -> str:
         if str.startswith(self.name, "AUTHOR_"):
@@ -356,6 +356,7 @@ class RuleActions:
                         if conversation.is_highlisted:
                             await conversation.unhighlight()
                         await conversation.archive()
+                        actioned = True
 
         return actioned
 
@@ -379,6 +380,9 @@ class RedditModmail:
     async def listen(self, subreddit: str):
         logging.info("Listening to modmail from subreddit: " + subreddit)
         subreddit_model = await self.reddit.subreddit(subreddit)
+        if subreddit_model is None:
+            logging.error(f"Failed to find subreddit {subreddit}.")
+            return
 
         for state in ["appeals", "archived", "inprogress", "join_requests", "mod", "new", "notifications"]:
             @self.reddit.register_event(subreddit_model.mod.stream.modmail_conversations, sort="recent", state=state)
@@ -479,7 +483,7 @@ class RedditModmail:
         if value is None:
             return False
 
-        if not isinstance(value, (str, int, List[str])):
+        if not isinstance(value, (str, int, list)):
             return False
 
         return True
