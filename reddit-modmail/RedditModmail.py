@@ -178,7 +178,7 @@ class Rule(Enum):
 
 class RuleActions:
     @staticmethod
-    def parse(rules: List[Tuple[str, Union[str, int, List[str]]]]) -> Optional['RuleActions']:
+    def parse(rules: List[Tuple[str, Union[str, int, bool, List[str]]]]) -> Optional['RuleActions']:
         rules_found: List[Tuple[Rule, Optional[str], list]]
         rules_found = []
 
@@ -186,7 +186,7 @@ class RuleActions:
             rule_key = key
             rule_value = value
 
-            if len(rule_value) <= 0:
+            if not isinstance(rule_value, bool) and len(rule_value) <= 0:
                 continue
 
             selector: Optional[str]
@@ -384,10 +384,17 @@ class RedditModmail:
             logging.error(f"Failed to find subreddit {subreddit}.")
             return
 
-        for state in ["appeals", "archived", "inprogress", "join_requests", "mod", "new", "notifications"]:
-            @self.reddit.register_event(subreddit_model.mod.stream.modmail_conversations, sort="recent", state=state)
+        for state in ["all", "appeals", "join_requests", "mod", "notifications"]:
+            @self.reddit.register_event(
+                subreddit_model.mod.stream.modmail_conversations,
+                sort="recent",
+                state=state,
+                skip_existing=True
+            )
             async def on_message(message: ModmailConversation, message_state=state):
-                await self.handle_message(subreddit_model, message, message_state)
+                actioned = await self.handle_message(subreddit_model, message, message_state)
+                logging.info(f"Result of handling message id {message.id} for subreddit {subreddit} from state "
+                             f"{message_state}: {actioned}.")
 
         if not self.has_listened:
             self.has_listened = True
@@ -395,6 +402,8 @@ class RedditModmail:
 
     async def handle_message(self, subreddit: Subreddit, message: ModmailConversation, state: str) -> bool:
         await message.load()
+        if message.
+        logging.info(f"Handling message id {message.id} for subreddit {subreddit.display_name} from state {state}.")
 
         config = self.parse_config_yaml(await self.get_config(subreddit, "reddit_modmail"))
         rules = self.get_rules_of_type(state, config)
@@ -411,7 +420,7 @@ class RedditModmail:
 
         return False
 
-    def get_rules_of_type(self, rule_type: str, rules: List[Dict[str, Union[str, int, List[str]]]]) -> []:
+    def get_rules_of_type(self, rule_type: str, rules: List[Dict[str, Union[str, int, bool, List[str]]]]) -> []:
         type_rules = []
 
         for rule in rules:
@@ -432,9 +441,9 @@ class RedditModmail:
     async def get_config(self, subreddit: Subreddit, wiki_page: str) -> str:
         return (await subreddit.wiki.get_page(wiki_page)).content_md
 
-    def parse_config_yaml(self, text: str) -> List[Dict[str, Union[str, int, List[str]]]]:
+    def parse_config_yaml(self, text: str) -> List[Dict[str, Union[str, int, bool, List[str]]]]:
         # https://github.com/reddit-archive/reddit/blob/master/r2/r2/lib/automoderator.py#L209
-        rules: List[Dict[str, Union[str, int, List[str]]]]
+        rules: List[Dict[str, Union[str, int, bool, List[str]]]]
         rules = []
 
         sections = [section.strip("\r\n") for section in re.split("^---", text, flags=re.MULTILINE)]
@@ -447,7 +456,7 @@ class RedditModmail:
             if not isinstance(parsed, dict):
                 continue
 
-            section_rules: List[Tuple[str, Union[str, int, List[str]]]]
+            section_rules: List[Tuple[str, Union[str, int, bool, List[str]]]]
             section_rules = []
             for key in parsed:
                 value = parsed[key]
@@ -483,7 +492,4 @@ class RedditModmail:
         if value is None:
             return False
 
-        if not isinstance(value, (str, int, list)):
-            return False
-
-        return True
+        return isinstance(value, (str, int, bool, list))
